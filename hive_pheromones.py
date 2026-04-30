@@ -55,9 +55,27 @@ USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 # Prospector's Bonanza state — first-100-agents bounty
 # Source of truth is on-chain (settlement events to TREASURY) — this in-memory
 # tally is a free-read approximation pending the on-chain indexer wiring.
-PROSPECTOR_TOTAL_SLOTS = 100
-PROSPECTOR_REBATE_USDC = 5.0
-PROSPECTOR_MAX_TREASURY_SPEND = 500.0  # hard cap — never exceeds
+# Gradient tier structure (post-2026-04-29 rebuild). Source of truth is
+# hivebank /v1/bank/prospector/state; gamification proxies it.
+#   Gold   x 10 @ $5  =  $50
+#   Silver x 30 @ $3  =  $90
+#   Bronze x 60 @ $1  =  $60
+#                       ----
+#                       $200 cap.
+PROSPECTOR_TOTAL_SLOTS         = 100
+PROSPECTOR_GOLD_SLOTS          = 10
+PROSPECTOR_SILVER_SLOTS        = 30
+PROSPECTOR_BRONZE_SLOTS        = 60
+PROSPECTOR_GOLD_REBATE_USDC    = 5.0
+PROSPECTOR_SILVER_REBATE_USDC  = 3.0
+PROSPECTOR_BRONZE_REBATE_USDC  = 1.0
+PROSPECTOR_MAX_TREASURY_SPEND  = (
+    PROSPECTOR_GOLD_SLOTS   * PROSPECTOR_GOLD_REBATE_USDC   +
+    PROSPECTOR_SILVER_SLOTS * PROSPECTOR_SILVER_REBATE_USDC +
+    PROSPECTOR_BRONZE_SLOTS * PROSPECTOR_BRONZE_REBATE_USDC
+)  # = $200, hard cap
+# Backwards-compat shim for any caller still referencing the flat rebate.
+PROSPECTOR_REBATE_USDC = PROSPECTOR_GOLD_REBATE_USDC
 
 
 # Cache layer — pull upstream every 30s, never block the page render
@@ -427,29 +445,57 @@ async def pulse_page():
 # ---------------------------------------------------------------------------
 
 async def get_prospector_state() -> Dict[str, Any]:
-    """Read on-chain bounty state. Until the indexer wires up, read from
-    hive-gamification rebates surface, falling back to default state."""
-    rebates = await fetch_cached("rebates", f"{GAMIFICATION_URL}/v1/rebates", timeout=4.0)
-    claimed = 0
-    if isinstance(rebates, dict):
-        claimed = rebates.get("prospector_claimed", 0) or rebates.get("total_claimants", 0) or 0
-    remaining = max(PROSPECTOR_TOTAL_SLOTS - int(claimed), 0)
+    """Source of truth: hivebank /v1/bank/prospector/state.
+    Cache layer: hive-gamification /v1/rebates (proxies hivebank).
+    Fallback: in-memory default state if both upstreams are unreachable.
+    """
+    state = await fetch_cached(
+        "prospector_state",
+        f"{GAMIFICATION_URL}/v1/rebates",
+        timeout=4.0,
+    )
+    if not isinstance(state, dict):
+        state = {}
+
+    gold_claimed   = int(state.get("gold_claimed",   0))
+    silver_claimed = int(state.get("silver_claimed", 0))
+    bronze_claimed = int(state.get("bronze_claimed", 0))
+    legacy_claimed = int(state.get("prospector_claimed", 0) or state.get("total_claimants", 0) or 0)
+    if (gold_claimed + silver_claimed + bronze_claimed) == 0 and legacy_claimed > 0:
+        # Old proxy returned a flat number; allocate gradient-first.
+        rem = legacy_claimed
+        gold_claimed   = min(rem, PROSPECTOR_GOLD_SLOTS);   rem -= gold_claimed
+        silver_claimed = min(rem, PROSPECTOR_SILVER_SLOTS); rem -= silver_claimed
+        bronze_claimed = min(rem, PROSPECTOR_BRONZE_SLOTS)
+
+    total_claimed = gold_claimed + silver_claimed + bronze_claimed
+    current_payout_usdc = (
+        gold_claimed   * PROSPECTOR_GOLD_REBATE_USDC   +
+        silver_claimed * PROSPECTOR_SILVER_REBATE_USDC +
+        bronze_claimed * PROSPECTOR_BRONZE_REBATE_USDC
+    )
+
     return {
-        "total_slots": PROSPECTOR_TOTAL_SLOTS,
-        "claimed": int(claimed),
-        "remaining": remaining,
-        "rebate_per_agent_usdc": PROSPECTOR_REBATE_USDC,
-        "max_total_spend_usdc": PROSPECTOR_MAX_TREASURY_SPEND,
-        "current_payout_usdc": int(claimed) * PROSPECTOR_REBATE_USDC,
+        "total_slots":            PROSPECTOR_TOTAL_SLOTS,
+        "claimed":                total_claimed,
+        "remaining":              max(PROSPECTOR_TOTAL_SLOTS - total_claimed, 0),
+        "max_total_spend_usdc":   PROSPECTOR_MAX_TREASURY_SPEND,
+        "current_payout_usdc":    current_payout_usdc,
+        "tiers": {
+            "gold":   {"slots": PROSPECTOR_GOLD_SLOTS,   "claimed": gold_claimed,   "remaining": PROSPECTOR_GOLD_SLOTS   - gold_claimed,   "rebate_usdc": PROSPECTOR_GOLD_REBATE_USDC},
+            "silver": {"slots": PROSPECTOR_SILVER_SLOTS, "claimed": silver_claimed, "remaining": PROSPECTOR_SILVER_SLOTS - silver_claimed, "rebate_usdc": PROSPECTOR_SILVER_REBATE_USDC},
+            "bronze": {"slots": PROSPECTOR_BRONZE_SLOTS, "claimed": bronze_claimed, "remaining": PROSPECTOR_BRONZE_SLOTS - bronze_claimed, "rebate_usdc": PROSPECTOR_BRONZE_REBATE_USDC},
+        },
         "treasury": TREASURY,
-        "asset": "USDC",
-        "chain": "base",
+        "asset":    "USDC",
+        "chain":    "base",
         "rules": [
-            "Eligibility: any agent (DID) that completes 3 distinct paid calls to the Hive fleet.",
-            "Payout: $5 USDC rebated to the agent's settlement address on Base.",
-            "Duration: until 100 slots are filled. No expiration.",
-            "Treasury cap: $500 total spend. Hard limit, on-chain enforced.",
+            "Eligibility: any agent (DID) that completes 3 distinct paid x402 calls to the Hive fleet within 30 days.",
+            "Tier allocation: first 10 -> $5 (gold), next 30 -> $3 (silver), next 60 -> $1 (bronze). FIFO.",
+            "Spectral cover: every payout runs the full SHOD 6-layer guard plus an Ed25519 ZK ticket bound to the prospector route.",
+            "Treasury cap: $200 total spend. Hard limit, enforced by the hivebank prospector module.",
             "Attribution: hive-referral-agent headers required on each call.",
+            "Single-use: each DID/address pair admitted exactly once; tx hashes cannot be reused across qualifications.",
         ],
     }
 
@@ -457,15 +503,47 @@ async def get_prospector_state() -> Dict[str, Any]:
 @app.get("/prospector", response_class=HTMLResponse)
 async def prospector_page():
     s = await get_prospector_state()
+    t = s["tiers"]
+    pool_remaining = s["max_total_spend_usdc"] - s["current_payout_usdc"]
+
+    def tier_row(label: str, td: Dict[str, Any]) -> str:
+        return (
+            f'<tr>'
+            f'<td style="color:{BRAND_GOLD}; font-weight:600; padding:10px 12px 10px 0;">{label}</td>'
+            f'<td class="num">${td["rebate_usdc"]:.0f}</td>'
+            f'<td class="num">{td["claimed"]} / {td["slots"]}</td>'
+            f'<td class="num">{td["remaining"]}</td>'
+            f'<td class="num">${td["slots"] * td["rebate_usdc"]:.0f}</td>'
+            f'</tr>'
+        )
+
+    tier_table = (
+        '<table style="width:100%; max-width:560px; margin: 24px 0 32px 0;">'
+        '<thead><tr>'
+        '<th style="width: 90px;">Tier</th>'
+        '<th>Per agent</th>'
+        '<th>Claimed</th>'
+        '<th>Remaining</th>'
+        '<th>Tier total</th>'
+        '</tr></thead>'
+        '<tbody>'
+        + tier_row("Gold",   t["gold"])
+        + tier_row("Silver", t["silver"])
+        + tier_row("Bronze", t["bronze"])
+        + '</tbody></table>'
+    )
+
     body = f"""
 <h1>Prospector's Bonanza</h1>
-<div class="sub">First 100 agents to make 3 paid calls to the Hive fleet earn $5 USDC back · public scoreboard · refreshes every 30 seconds</div>
-<div style="margin: 32px 0 40px 0;">
+<div class="sub">First 100 agents to make 3 paid calls to the Hive fleet earn a USDC rebate · gradient $5 / $3 / $1 · public scoreboard · refreshes every 30 seconds</div>
+<div style="margin: 32px 0 24px 0;">
   <div class="stat"><div class="label">Slots remaining</div><div class="big">{s['remaining']}</div></div>
   <div class="stat"><div class="label">Claimed</div><div class="big">{s['claimed']}/{s['total_slots']}</div></div>
-  <div class="stat"><div class="label">Rebate per agent</div><div class="big">${s['rebate_per_agent_usdc']:.0f}</div></div>
-  <div class="stat"><div class="label">Pool remaining</div><div class="big">${s['max_total_spend_usdc'] - s['current_payout_usdc']:.0f}</div></div>
+  <div class="stat"><div class="label">Pool budget</div><div class="big">${s['max_total_spend_usdc']:.0f}</div></div>
+  <div class="stat"><div class="label">Pool remaining</div><div class="big">${pool_remaining:.0f}</div></div>
 </div>
+<h3 style="color:{BRAND_GOLD}; font-weight:500; font-size:14px; letter-spacing:0.02em;">TIER BREAKDOWN</h3>
+{tier_table}
 <h3 style="color:{BRAND_GOLD}; font-weight:500; font-size:14px; letter-spacing:0.02em;">RULES</h3>
 <ul style="font-size: 13px; line-height: 1.7; color:{TEXT};">
   {''.join(f'<li>{r}</li>' for r in s['rules'])}
@@ -474,7 +552,7 @@ async def prospector_page():
 <p style="font-size:13px; line-height:1.6;">
   Pick any 3 from the <a href="/index">Hive Index</a>. Pay $0.005–$0.10 per call. Be the first 100 to do it.
 </p>
-<p class="sub" style="margin-top: 32px;">Treasury <code>{TREASURY}</code> · contract enforcement on Base · spend ceiling <code>${PROSPECTOR_MAX_TREASURY_SPEND}</code>.</p>
+<p class="sub" style="margin-top: 32px;">Treasury <code>{TREASURY}</code> · contract enforcement on Base · spend ceiling <code>${PROSPECTOR_MAX_TREASURY_SPEND:.0f}</code>.</p>
 """
     return HTMLResponse(page("Prospector's Bonanza", body, refresh=30))
 
