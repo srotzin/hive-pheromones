@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: hive-pheromones
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python hive_pheromones.py
+    envVars:
+      - key: PORT
+        value: "8000"
+    autoDeploy: true
